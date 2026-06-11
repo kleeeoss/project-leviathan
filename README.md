@@ -10,7 +10,7 @@
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 Leviathan completely decouples the **Orchestrator** (The Brain) from the **AI Execution Workers** (The Muscle) using an event-driven message broker pattern, managed via Infrastructure as Code (IaC).
 
@@ -62,7 +62,7 @@ graph TD
 - **CI/CD Pipeline:** Fully automated **GitHub Actions** workflows validating Python code quality (`flake8`) and Terraform syntax (`terraform validate`) on every push.
     
 
-## 🧠 Algorithmic Foundations
+## Algorithmic Foundations
 
 Leviathan is built on strict mathematical and distributed systems foundations to ensure deterministic execution.
 
@@ -140,7 +140,7 @@ Execute the core engine. It will automatically load `workflow.json`, validate th
 python core.py
 ```
 
-## 📂 Project Structure
+## Project Structure
 
 ```
 leviathan/
