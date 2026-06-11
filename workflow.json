@@ -1,0 +1,20 @@
+{
+  "name": "Tech Research Pipeline",
+  "tasks": [
+    {
+      "id": "fetch_aws",
+      "prompt": "Write a 2-sentence summary of AWS Lambda.",
+      "dependencies": []
+    },
+    {
+      "id": "fetch_gcp",
+      "prompt": "Write a 2-sentence summary of Google Cloud Functions.",
+      "dependencies": []
+    },
+    {
+      "id": "compare",
+      "prompt": "Read the following summaries:\nAWS: {fetch_aws}\nGCP: {fetch_gcp}\n\nWrite a 1-paragraph conclusion comparing the two.",
+      "dependencies": ["fetch_aws", "fetch_gcp"]
+    }
+  ]
+}

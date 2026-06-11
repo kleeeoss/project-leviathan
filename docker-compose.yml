@@ -1,0 +1,18 @@
+services:
+  localstack:
+    container_name: leviathan_localstack
+    image: localstack/localstack:latest
+    ports:
+      - "127.0.0.1:4566:4566"
+      - "127.0.0.1:4510-4559:4510-4559"
+
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      LOCALSTACK_AUTH_TOKEN: ls-CoTIbIFO-2964-BoVE-zIME-zIFUKipo81cc
+
+    volumes:
+      - leviathan_localstack_data:/var/lib/localstack
+
+volumes:
+  leviathan_localstack_data:

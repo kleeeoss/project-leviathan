@@ -1,0 +1,51 @@
+# ========================
+# 1. Environment & Secrets
+# ========================
+.env
+*.pem
+*.key
+
+# ========================
+# 2. Python & Virtual Env
+# ========================
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# ========================
+# 3. Terraform (CRITICAL)
+# ========================
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files (Contains your raw cloud architecture secrets!)
+*.tfstate
+*.tfstate.*
+terraform.tfstate
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Ignore override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Ignore variables files
+*.tfvars
+*.tfvars.json
+
+# ========================
+# 4. IDEs & OS Files
+# ========================
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
