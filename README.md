@@ -72,7 +72,7 @@ Before any execution begins, the engine maps the workflow schema to a Directed A
 
 $$\mathcal{O}(|V| + |E|)$$
 
-_Where $\mathbf{V}$ represents the task nodes and $\mathbf{E}$ represents the dependency edges._
+_Where V represents the task nodes and E represents the dependency edges._
 
 ### 2. Transient Fault Tolerance (Resiliency)
 
@@ -80,7 +80,7 @@ Cloud environments are inherently unstable. The worker nodes implement **Exponen
 
 $$T_{\text{wait}} = \left( B \times 2^n \right) + \text{Jitter}(0.1, 1.0)$$
 
-_Where $\mathbf{B}$ is the base wait time in seconds, and $\mathbf{n}$ is the current retry attempt._
+_Where B is the base wait time in seconds, and n is the current retry attempt._
 
 ### 3. Dynamic Context Passing (Data Flow)
 
