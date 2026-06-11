@@ -1,4 +1,4 @@
-# Leviathan: Distributed Cloud-Native DAG Orchestrator 🌊
+# Leviathan: Distributed Cloud-Native DAG Orchestrator
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue.svg)
 ![Terraform](https://img.shields.io/badge/Terraform-IaC-8A2BE2.svg)
