@@ -9,7 +9,7 @@ on:
 
 jobs:
   python-validation:
-    name: Python Code Quality
+    name: Python Code Quality & Unit Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -19,18 +19,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: 'pip'
+          cache: "pip"
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install flake8
-          # We install flake8 to scan the code for syntax errors and undefined names
+          pip install flake8 pytest pytest-asyncio
+          pip install -r requirements.txt
 
       - name: Run Python Linter
         run: |
           # Stop the build if there are Python syntax errors or undefined names
-          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=venv,env,.git,__pycache__,infrastructure
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run Automated DAG Unit Tests
+        run: |
+          pytest tests/ -v
 
   terraform-validation:
     name: Infrastructure as Code (IaC) Validation
@@ -45,9 +49,7 @@ jobs:
       - name: Initialize Terraform
         working-directory: ./infrastructure
         run: terraform init -backend=false
-        # backend=false ensures we just test the code without needing real AWS credentials
 
       - name: Validate Terraform Syntax
         working-directory: ./infrastructure
         run: terraform validate
-        # This checks if the main.tf file has perfect syntax

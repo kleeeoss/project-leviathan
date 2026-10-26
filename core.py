@@ -2,8 +2,11 @@ import asyncio
 import os
 import random
 import json
-import aioboto3, boto3
+import aioboto3
+import boto3
 import uuid
+import collections
+import string
 from google import genai
 from dotenv import load_dotenv
 from enum import Enum
@@ -22,6 +25,7 @@ class TaskStatus(Enum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class TaskNode:
@@ -89,23 +93,27 @@ class LambdaWorker:
 
                 if "Messages" in response:
                     for message in response["Messages"]:
-                        body = json.loads(message["Body"])
-                        print(f"⚡ [{self.worker_id}] Pulled Task '{body['task_id']}' from real SQS!")
+                        try:
+                            body = json.loads(message["Body"])
+                            print(f"⚡ [{self.worker_id}] Pulled Task '{body['task_id']}' from real SQS!")
 
-                        # Process task via AI
-                        result_payload = await self._invoke_llm(body)
+                            # Process task via AI
+                            result_payload = await self._invoke_llm(body)
 
-                        # Push result to response queue
-                        await sqs.send_message(
-                            QueueUrl=self.qm.response_queue_url,
-                            MessageBody=json.dumps(result_payload)
-                        )
+                            # Push result to response queue
+                            await sqs.send_message(
+                                QueueUrl=self.qm.response_queue_url,
+                                MessageBody=json.dumps(result_payload)
+                            )
 
-                        # Delete message from task queue so no one else processes it
-                        await sqs.delete_message(
-                            QueueUrl=self.qm.task_queue_url,
-                            ReceiptHandle=message["ReceiptHandle"]
-                        )
+                            # Delete message from task queue so no one else processes it
+                            await sqs.delete_message(
+                                QueueUrl=self.qm.task_queue_url,
+                                ReceiptHandle=message["ReceiptHandle"]
+                            )
+                        except Exception as e:
+                            # Transient processing error: do not ack/delete message so visibility timeout allows redelivery
+                            print(f"⚠️ [{self.worker_id}] Transient error processing task message: {e}. Message retained in queue.")
                 await asyncio.sleep(0.5)
 
     async def _invoke_llm(self, task_data: dict) -> dict:
@@ -115,11 +123,11 @@ class LambdaWorker:
         for attempt in range(1, max_retries + 1):
             try:
                 response = await local_client.aio.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=task_data['prompt']
+                    model="gemini-2.5-flash",
+                    contents=task_data["prompt"]
                 )
                 return {
-                    "task_id": task_data['task_id'],
+                    "task_id": task_data["task_id"],
                     "status": TaskStatus.COMPLETED.value,  # <-- .value prevents JSON crash
                     "result": response.text.strip(),
                     "error": None
@@ -128,7 +136,7 @@ class LambdaWorker:
                 print(f"⚠️ [{self.worker_id}] Transient Error on '{task_data['task_id']}': {e}")
                 if attempt == max_retries:
                     return {
-                        "task_id": task_data['task_id'],
+                        "task_id": task_data["task_id"],
                         "status": TaskStatus.FAILED.value,  # <-- .value prevents JSON crash
                         "result": None,
                         "error": str(e)
@@ -144,24 +152,103 @@ class DAGOrchestrator:
     def __init__(self):
         self.nodes: Dict[str, TaskNode] = {}
         self.qm = AWSQueueManager()
+        self.completed_count = 0
+        self.failed_count = 0
+        self.cancelled_count = 0
 
     def add_node(self, node: TaskNode):
         self.nodes[node.task_id] = node
 
     def load_from_json(self, filepath: str):
-        with open(filepath, 'r') as file:
+        with open(filepath, "r") as file:
             data = json.load(file)
-        for task_data in data.get('tasks', []):
+        for task_data in data.get("tasks", []):
             self.add_node(TaskNode(
-                task_id=task_data['id'],
-                prompt=task_data['prompt'],
-                dependencies=task_data.get('dependencies', [])
+                task_id=task_data["id"],
+                prompt=task_data["prompt"],
+                dependencies=task_data.get("dependencies", [])
             ))
         print(f"📄 [ENGINE] Loaded {len(self.nodes)} tasks from JSON.")
 
-    async def _publish_ready_tasks(self, shared_in_degree: dict, sqs_client):
+    def validate_graph(self) -> List[str]:
+        """
+        Validates graph acyclicity and dependency consistency using Kahn's algorithm (O(V+E)).
+        Also validates that prompt template variables match declared dependencies.
+        Returns topological ordering of task IDs if valid.
+        Raises ValueError if a cycle, unknown dependency, or template mismatch is detected.
+        """
+        # 1. Check for unknown dependencies and prompt template variable mismatches
+        for task_id, node in self.nodes.items():
+            for dep in node.dependencies:
+                if dep not in self.nodes:
+                    raise ValueError(f"Task '{task_id}' depends on unknown task '{dep}'")
+
+            formatter = string.Formatter()
+            for _, field_name, _, _ in formatter.parse(node.prompt):
+                if field_name is not None and field_name != "":
+                    if field_name not in node.dependencies:
+                        raise ValueError(
+                            f"Task '{task_id}' prompt template variable '{field_name}' "
+                            f"not found in declared dependencies: {node.dependencies}"
+                        )
+
+        # 2. Kahn's Algorithm for cycle detection (O(V + E) using deque)
+        in_degree = {task_id: len(node.dependencies) for task_id, node in self.nodes.items()}
+        adj_list = collections.defaultdict(list)
+        for task_id, node in self.nodes.items():
+            for dep in node.dependencies:
+                adj_list[dep].append(task_id)
+
+        queue = collections.deque([task_id for task_id, deg in in_degree.items() if deg == 0])
+        topological_order = []
+
+        while queue:
+            curr = queue.popleft()
+            topological_order.append(curr)
+            for neighbor in adj_list[curr]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        if len(topological_order) != len(self.nodes):
+            raise ValueError("Cycle detected in DAG")
+
+        return topological_order
+
+    def _handle_failure(self, failed_task_id: str, error_msg: str, shared_in_degree: dict, adj_list: dict):
+        """
+        Handles terminal task failure by marking the failed node and performing BFS
+        cascade cancellation of all transitive downstream descendants while leaving
+        orthogonal, independent DAG branches untouched.
+        """
+        failed_node = self.nodes[failed_task_id]
+        if failed_node.status == TaskStatus.FAILED:
+            return
+
+        failed_node.status = TaskStatus.FAILED
+        failed_node.result = None
+        self.failed_count += 1
+        print(f"❌ [ENGINE] Marked Task '{failed_task_id}' as FAILED: {error_msg}")
+
+        # BFS cascade cancellation of all transitive downstream descendants
+        queue = collections.deque(adj_list.get(failed_task_id, []))
+        visited = set(queue)
+
+        while queue:
+            descendant_id = queue.popleft()
+            descendant = self.nodes[descendant_id]
+            if descendant.status in (TaskStatus.PENDING, TaskStatus.QUEUED):
+                descendant.status = TaskStatus.CANCELLED
+                self.cancelled_count += 1
+                print(f"🚫 [ENGINE] Cascade Cancelled downstream task '{descendant_id}' due to ancestor failure of '{failed_task_id}'.")
+            for child in adj_list.get(descendant_id, []):
+                if child not in visited:
+                    visited.add(child)
+                    queue.append(child)
+
+    async def _publish_ready_tasks(self, shared_in_degree: dict, sqs_client, adj_list: dict):
         """Publishes tasks directly into the LocalStack SQS queue via AWS SDK."""
-        for task_id, degree in shared_in_degree.items():
+        for task_id, degree in list(shared_in_degree.items()):
             node = self.nodes[task_id]
             if degree == 0 and node.status == TaskStatus.PENDING:
                 context = {dep: self.nodes[dep].result for dep in node.dependencies}
@@ -169,7 +256,7 @@ class DAGOrchestrator:
                     resolved_prompt = node.prompt.format(**context)
                     payload = {"task_id": task_id, "prompt": resolved_prompt}
 
-                    # Core change: Send via AWS SDK
+                    # Send via AWS SDK
                     await sqs_client.send_message(
                         QueueUrl=self.qm.task_queue_url,
                         MessageBody=json.dumps(payload)
@@ -179,10 +266,13 @@ class DAGOrchestrator:
                     print(f"📥 [ENGINE] Successfully pushed payload for '{task_id}' into AWS SQS.")
                 except KeyError as e:
                     print(f"❌ [ENGINE] Formatting Error on '{task_id}': missing template variable {e}")
-                    node.status = TaskStatus.FAILED
+                    self._handle_failure(task_id, f"Missing template variable: {e}", shared_in_degree, adj_list)
 
     async def run(self):
         print("🚀 [ENGINE] Initializing LocalStack Cloud-Native Runtime...")
+
+        # 0. Pre-Flight Graph Validation
+        self.validate_graph()
 
         # 1. Spin up queues inside LocalStack container
         await self.qm.initialize_queues()
@@ -198,15 +288,14 @@ class DAGOrchestrator:
             for dep in task.dependencies:
                 adj_list[dep].append(task_id)
 
-        completed_count = 0
         target_count = len(self.nodes)
 
         # 4. Open Orchestrator Client connection to poll for completions
         async with self.qm.session.client("sqs", endpoint_url=LOCALSTACK_ENDPOINT) as sqs:
             # Seed the initial tasks into SQS
-            await self._publish_ready_tasks(shared_in_degree, sqs)
+            await self._publish_ready_tasks(shared_in_degree, sqs, adj_list)
 
-            while completed_count < target_count:
+            while (self.completed_count + self.failed_count + self.cancelled_count) < target_count:
                 # Poll the Response queue for results from Lambdas
                 response = await sqs.receive_message(
                     QueueUrl=self.qm.response_queue_url,
@@ -216,30 +305,43 @@ class DAGOrchestrator:
 
                 if "Messages" in response:
                     for message in response["Messages"]:
-                        body = json.loads(message["Body"])
-                        node = self.nodes[body['task_id']]
+                        # Distinguish transient processing errors from terminal task results
+                        try:
+                            body = json.loads(message["Body"])
+                            task_id = body["task_id"]
+                            status = TaskStatus(body["status"])
+                            result = body.get("result")
+                            error = body.get("error")
+                            node = self.nodes[task_id]
+                        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                            # Transient processing error: do NOT delete message;
+                            # leave in SQS queue for visibility-timeout redelivery
+                            print(f"⚠️ [ENGINE] Transient processing error on received message: {exc}. Retaining in SQS.")
+                            continue
 
-                        # Convert the JSON string back into a Python Enum!
-                        node.status = TaskStatus(body['status'])
-                        node.result = body['result']
-                        completed_count += 1
+                        try:
+                            if status == TaskStatus.COMPLETED:
+                                node.status = TaskStatus.COMPLETED
+                                node.result = result
+                                self.completed_count += 1
+                                print(f"✅ [ENGINE] Context Loopback: Processed '{node.task_id}' from Response SQS.")
+                                for neighbor in adj_list[node.task_id]:
+                                    shared_in_degree[neighbor] -= 1
 
-                        if node.status == TaskStatus.COMPLETED:
-                            print(f"✅ [ENGINE] Context Loopback: Processed '{node.task_id}' from Response SQS.")
-                            for neighbor in adj_list[node.task_id]:
-                                shared_in_degree[neighbor] -= 1
+                                # Publish newly unlocked tasks
+                                await self._publish_ready_tasks(shared_in_degree, sqs, adj_list)
+                            elif status == TaskStatus.FAILED:
+                                print(f"❌ [ENGINE] Terminal Failure reported on Node '{node.task_id}': {error}")
+                                self._handle_failure(node.task_id, error or "Task failed", shared_in_degree, adj_list)
+                            else:
+                                print(f"⚠️ [ENGINE] Unexpected task status '{status}' for '{node.task_id}'")
+                        finally:
+                            # Acknowledge and delete terminal task response from queue
+                            await sqs.delete_message(
+                                QueueUrl=self.qm.response_queue_url,
+                                ReceiptHandle=message["ReceiptHandle"]
+                            )
 
-                            # Publish newly unlocked tasks
-                            await self._publish_ready_tasks(shared_in_degree, sqs)
-                        else:
-                            print(f"❌ [ENGINE] Fatal Failure on Node '{node.task_id}': {body['error']}")
-                            break
-
-                        # Delete read message from response queue
-                        await sqs.delete_message(
-                            QueueUrl=self.qm.response_queue_url,
-                            ReceiptHandle=message["ReceiptHandle"]
-                        )
                 await asyncio.sleep(0.5)
 
         for wt in worker_tasks:
