@@ -3,8 +3,6 @@ import os
 import random
 import json
 import aioboto3
-import boto3
-import uuid
 import collections
 import string
 from google import genai
@@ -268,6 +266,75 @@ class DAGOrchestrator:
                     print(f"❌ [ENGINE] Formatting Error on '{task_id}': missing template variable {e}")
                     self._handle_failure(task_id, f"Missing template variable: {e}", shared_in_degree, adj_list)
 
+    async def _process_response_message(
+        self,
+        message: dict,
+        shared_in_degree: dict,
+        adj_list: dict,
+        sqs_client
+    ) -> bool:
+        """
+        Processes a single SQS message from the response queue.
+        Distinguishes transient processing errors from terminal task results.
+        Returns True if message was acknowledged (terminal result, duplicate, or unroutable message),
+        or False if message had a transient processing error (retained in SQS for redelivery).
+        """
+        try:
+            body = json.loads(message["Body"])
+            task_id = body["task_id"]
+            status = TaskStatus(body["status"])
+            result = body.get("result")
+            error = body.get("error")
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            # Transient processing error: do NOT delete message;
+            # leave in SQS queue for visibility-timeout redelivery
+            print(f"⚠️ [ENGINE] Transient processing error on received message: {exc}. Retaining in SQS.")
+            return False
+
+        # If task_id does not belong to this DAG, acknowledge and delete to prevent queue poisoning
+        if task_id not in self.nodes:
+            print(f"⚠️ [ENGINE] Unknown task_id '{task_id}' in response queue. Acknowledging to prevent queue poisoning.")
+            await sqs_client.delete_message(
+                QueueUrl=self.qm.response_queue_url,
+                ReceiptHandle=message["ReceiptHandle"]
+            )
+            return True
+
+        node = self.nodes[task_id]
+
+        # Idempotency guard: If node is already in a terminal state, acknowledge duplicate delivery
+        if node.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            print(f"⚠️ [ENGINE] Duplicate response received for task '{task_id}' in state {node.status.value}. Acknowledging.")
+            await sqs_client.delete_message(
+                QueueUrl=self.qm.response_queue_url,
+                ReceiptHandle=message["ReceiptHandle"]
+            )
+            return True
+
+        try:
+            if status == TaskStatus.COMPLETED:
+                node.status = TaskStatus.COMPLETED
+                node.result = result
+                self.completed_count += 1
+                print(f"✅ [ENGINE] Context Loopback: Processed '{node.task_id}' from Response SQS.")
+                for neighbor in adj_list.get(node.task_id, []):
+                    shared_in_degree[neighbor] -= 1
+
+                # Publish newly unlocked tasks
+                await self._publish_ready_tasks(shared_in_degree, sqs_client, adj_list)
+            elif status == TaskStatus.FAILED:
+                print(f"❌ [ENGINE] Terminal Failure reported on Node '{node.task_id}': {error}")
+                self._handle_failure(node.task_id, error or "Task failed", shared_in_degree, adj_list)
+            else:
+                print(f"⚠️ [ENGINE] Unexpected task status '{status}' for '{node.task_id}'")
+        finally:
+            # Acknowledge and delete terminal task response from queue
+            await sqs_client.delete_message(
+                QueueUrl=self.qm.response_queue_url,
+                ReceiptHandle=message["ReceiptHandle"]
+            )
+        return True
+
     async def run(self):
         print("🚀 [ENGINE] Initializing LocalStack Cloud-Native Runtime...")
 
@@ -305,42 +372,7 @@ class DAGOrchestrator:
 
                 if "Messages" in response:
                     for message in response["Messages"]:
-                        # Distinguish transient processing errors from terminal task results
-                        try:
-                            body = json.loads(message["Body"])
-                            task_id = body["task_id"]
-                            status = TaskStatus(body["status"])
-                            result = body.get("result")
-                            error = body.get("error")
-                            node = self.nodes[task_id]
-                        except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                            # Transient processing error: do NOT delete message;
-                            # leave in SQS queue for visibility-timeout redelivery
-                            print(f"⚠️ [ENGINE] Transient processing error on received message: {exc}. Retaining in SQS.")
-                            continue
-
-                        try:
-                            if status == TaskStatus.COMPLETED:
-                                node.status = TaskStatus.COMPLETED
-                                node.result = result
-                                self.completed_count += 1
-                                print(f"✅ [ENGINE] Context Loopback: Processed '{node.task_id}' from Response SQS.")
-                                for neighbor in adj_list[node.task_id]:
-                                    shared_in_degree[neighbor] -= 1
-
-                                # Publish newly unlocked tasks
-                                await self._publish_ready_tasks(shared_in_degree, sqs, adj_list)
-                            elif status == TaskStatus.FAILED:
-                                print(f"❌ [ENGINE] Terminal Failure reported on Node '{node.task_id}': {error}")
-                                self._handle_failure(node.task_id, error or "Task failed", shared_in_degree, adj_list)
-                            else:
-                                print(f"⚠️ [ENGINE] Unexpected task status '{status}' for '{node.task_id}'")
-                        finally:
-                            # Acknowledge and delete terminal task response from queue
-                            await sqs.delete_message(
-                                QueueUrl=self.qm.response_queue_url,
-                                ReceiptHandle=message["ReceiptHandle"]
-                            )
+                        await self._process_response_message(message, shared_in_degree, adj_list, sqs)
 
                 await asyncio.sleep(0.5)
 

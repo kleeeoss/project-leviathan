@@ -1,7 +1,6 @@
 import pytest
-import collections
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 from core import DAGOrchestrator, TaskNode, TaskStatus
 
 
@@ -128,7 +127,6 @@ def test_diamond_graph_cascade_cancellation():
 @pytest.mark.asyncio
 async def test_publish_ready_tasks_handles_formatting_keyerror():
     orch = DAGOrchestrator()
-    # A has no result yet, but B needs {A}
     orch.add_node(TaskNode("A", "Root", []))
     orch.add_node(TaskNode("B", "Process {non_existent_key}", []))
 
@@ -144,41 +142,45 @@ async def test_publish_ready_tasks_handles_formatting_keyerror():
 
 
 @pytest.mark.asyncio
-async def test_sqs_message_handling_distinguishes_transient_from_terminal():
+async def test_sqs_message_handling_transient_error_retains_message():
     """
-    Verifies that:
-    1. Transient message decoding/processing errors leave message in SQS (no delete_message).
-    2. Terminal failure responses delete the message and trigger cascade cancellation.
-    3. Terminal success responses delete the message and advance the DAG.
+    Verifies that malformed message JSON is treated as a transient error:
+    the message is NOT deleted from SQS so visibility timeout allows redelivery.
     """
     orch = DAGOrchestrator()
+    orch.qm.response_queue_url = "https://sqs.mock/response-queue"
     orch.add_node(TaskNode("A", "Do A", []))
-    orch.add_node(TaskNode("B", "Do B: {A}", ["A"]))
 
-    shared_in_degree = {"A": 0, "B": 1}
-    adj_list = {"A": ["B"], "B": []}
-
+    shared_in_degree = {"A": 0}
+    adj_list = {"A": []}
     mock_sqs = AsyncMock()
-    mock_sqs.delete_message = AsyncMock()
 
-    # 1. Transient error: corrupted/malformed message body
     malformed_msg = {
         "Body": "INVALID_JSON_CORRUPTED{",
         "ReceiptHandle": "handle_malformed_1"
     }
 
-    try:
-        body = json.loads(malformed_msg["Body"])
-        task_id = body["task_id"]
-        status = TaskStatus(body["status"])
-    except (json.JSONDecodeError, KeyError, ValueError) as exc:
-        # Transient error logic from core.py
-        pass
+    handled = await orch._process_response_message(malformed_msg, shared_in_degree, adj_list, mock_sqs)
 
-    # Verify no deletion for transient error
+    assert handled is False
     mock_sqs.delete_message.assert_not_called()
 
-    # 2. Terminal failure reported by worker
+
+@pytest.mark.asyncio
+async def test_sqs_message_handling_terminal_failure_deletes_and_cancels():
+    """
+    Verifies that worker-reported terminal failures trigger cascade cancellation
+    and delete the message from the SQS response queue.
+    """
+    orch = DAGOrchestrator()
+    orch.qm.response_queue_url = "https://sqs.mock/response-queue"
+    orch.add_node(TaskNode("A", "Do A", []))
+    orch.add_node(TaskNode("B", "Do B: {A}", ["A"]))
+
+    shared_in_degree = {"A": 0, "B": 1}
+    adj_list = {"A": ["B"], "B": []}
+    mock_sqs = AsyncMock()
+
     terminal_fail_msg = {
         "Body": json.dumps({
             "task_id": "A",
@@ -189,16 +191,136 @@ async def test_sqs_message_handling_distinguishes_transient_from_terminal():
         "ReceiptHandle": "handle_terminal_fail_2"
     }
 
-    body = json.loads(terminal_fail_msg["Body"])
-    status = TaskStatus(body["status"])
-    try:
-        if status == TaskStatus.FAILED:
-            orch._handle_failure(body["task_id"], body["error"], shared_in_degree, adj_list)
-    finally:
-        await mock_sqs.delete_message(QueueUrl="resp_q", ReceiptHandle=terminal_fail_msg["ReceiptHandle"])
+    handled = await orch._process_response_message(terminal_fail_msg, shared_in_degree, adj_list, mock_sqs)
 
+    assert handled is True
     assert orch.nodes["A"].status == TaskStatus.FAILED
     assert orch.nodes["B"].status == TaskStatus.CANCELLED
     assert orch.failed_count == 1
     assert orch.cancelled_count == 1
-    mock_sqs.delete_message.assert_called_once_with(QueueUrl="resp_q", ReceiptHandle="handle_terminal_fail_2")
+    mock_sqs.delete_message.assert_called_once_with(
+        QueueUrl="https://sqs.mock/response-queue",
+        ReceiptHandle="handle_terminal_fail_2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqs_message_handling_terminal_success_advances_dag():
+    """
+    Verifies that successful task results update state, unlock dependent tasks,
+    and delete the message from the SQS response queue.
+    """
+    orch = DAGOrchestrator()
+    orch.qm.response_queue_url = "https://sqs.mock/response-queue"
+    orch.qm.task_queue_url = "https://sqs.mock/task-queue"
+    orch.add_node(TaskNode("A", "Do A", []))
+    orch.add_node(TaskNode("B", "Do B: {A}", ["A"]))
+
+    shared_in_degree = {"A": 0, "B": 1}
+    adj_list = {"A": ["B"], "B": []}
+    mock_sqs = AsyncMock()
+
+    success_msg = {
+        "Body": json.dumps({
+            "task_id": "A",
+            "status": TaskStatus.COMPLETED.value,
+            "result": "Output from task A",
+            "error": None
+        }),
+        "ReceiptHandle": "handle_success_3"
+    }
+
+    handled = await orch._process_response_message(success_msg, shared_in_degree, adj_list, mock_sqs)
+
+    assert handled is True
+    assert orch.nodes["A"].status == TaskStatus.COMPLETED
+    assert orch.nodes["A"].result == "Output from task A"
+    assert orch.completed_count == 1
+    assert shared_in_degree["B"] == 0
+    # B was unlocked and published
+    assert orch.nodes["B"].status == TaskStatus.QUEUED
+    mock_sqs.send_message.assert_called_once()
+    mock_sqs.delete_message.assert_called_once_with(
+        QueueUrl="https://sqs.mock/response-queue",
+        ReceiptHandle="handle_success_3"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqs_message_handling_duplicate_response_is_idempotent():
+    """
+    Verifies that duplicate SQS deliveries for an already-completed task
+    acknowledge the message without double-incrementing counters or in-degrees.
+    """
+    orch = DAGOrchestrator()
+    orch.qm.response_queue_url = "https://sqs.mock/response-queue"
+    orch.qm.task_queue_url = "https://sqs.mock/task-queue"
+    orch.add_node(TaskNode("A", "Do A", []))
+    orch.add_node(TaskNode("B", "Do B: {A}", ["A"]))
+
+    shared_in_degree = {"A": 0, "B": 1}
+    adj_list = {"A": ["B"], "B": []}
+    mock_sqs = AsyncMock()
+
+    success_msg = {
+        "Body": json.dumps({
+            "task_id": "A",
+            "status": TaskStatus.COMPLETED.value,
+            "result": "Output from task A",
+            "error": None
+        }),
+        "ReceiptHandle": "handle_success_4"
+    }
+
+    # First delivery
+    await orch._process_response_message(success_msg, shared_in_degree, adj_list, mock_sqs)
+    assert orch.completed_count == 1
+    assert shared_in_degree["B"] == 0
+
+    # Second (duplicate) delivery
+    mock_sqs.reset_mock()
+    handled = await orch._process_response_message(success_msg, shared_in_degree, adj_list, mock_sqs)
+
+    assert handled is True
+    # Counters must NOT increment again
+    assert orch.completed_count == 1
+    # In-degree must NOT drop below 0
+    assert shared_in_degree["B"] == 0
+    # Duplicate message must still be deleted from queue
+    mock_sqs.delete_message.assert_called_once_with(
+        QueueUrl="https://sqs.mock/response-queue",
+        ReceiptHandle="handle_success_4"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqs_message_handling_unknown_task_is_acknowledged():
+    """
+    Verifies that an unroutable message with unknown task_id is acknowledged
+    to prevent indefinite queue head-of-line blocking.
+    """
+    orch = DAGOrchestrator()
+    orch.qm.response_queue_url = "https://sqs.mock/response-queue"
+    orch.add_node(TaskNode("A", "Do A", []))
+
+    shared_in_degree = {"A": 0}
+    adj_list = {"A": []}
+    mock_sqs = AsyncMock()
+
+    alien_msg = {
+        "Body": json.dumps({
+            "task_id": "alien_task_999",
+            "status": TaskStatus.COMPLETED.value,
+            "result": "Who am I?",
+            "error": None
+        }),
+        "ReceiptHandle": "handle_alien_5"
+    }
+
+    handled = await orch._process_response_message(alien_msg, shared_in_degree, adj_list, mock_sqs)
+
+    assert handled is True
+    mock_sqs.delete_message.assert_called_once_with(
+        QueueUrl="https://sqs.mock/response-queue",
+        ReceiptHandle="handle_alien_5"
+    )
